@@ -42,7 +42,7 @@ func main() {
 	fs.StringVar(&password, "password", "", "Redis password (can also be set via EXPIREDIS_PASSWORD env var)")
 	fs.StringVar(&pattern, "pattern", "*", "Pattern of keys to process")
 	fs.IntVar(&limit, "limit", 100, "Maximum number of keys to modify (delete, set TTL, etc.)")
-	fs.IntVar(&batchSize, "batch-size", 100, "Keys to fetch in each batch")
+	fs.IntVar(&batchSize, "batch-size", 500, "Keys to fetch in each batch")
 	fs.Int64Var(&delay, "delay", 0, "Delay in ms between batches")
 	fs.IntVar(&ttlSet, "set-ttl", 0, "Set TTL in seconds of matched keys")
 	fs.IntVar(&ttlSubtract, "subtract-ttl", 0, "Seconds to subtract from TTL of matched keys")
@@ -147,18 +147,50 @@ func main() {
 			logger.info.Printf("Found %d keys in this batch\n", len(scan.batch))
 		}
 
+		// Separate keys that need TTL checking from those that don't
+		var keysNeedingTTL []string
+		var keysNoTTL []string
+
 		for _, key := range scan.batch {
 			scan.scanned++
 
-			if processKey(c, key) {
+			// Check if this key needs TTL verification
+			if ttlMin != 0 || ttlSubtract != 0 {
+				keysNeedingTTL = append(keysNeedingTTL, key)
+			} else {
+				keysNoTTL = append(keysNoTTL, key)
+			}
+		}
+
+		// Process keys that don't need TTL checking immediately
+		for _, key := range keysNoTTL {
+			if processKeyNoTTL(c, key) {
 				scan.modified++
 				expired_stats <- 1
 
-				logger.info.Printf("Modified %d keys so far. Limit is %d\n", scan.modified, limit)
 				if limit >= 0 && scan.modified >= limit {
 					logger.info.Println("Reached limit of", limit, "modified keys")
 					scan.complete = true
 					break
+				}
+			}
+		}
+
+		// Process keys that need TTL checking in batches
+		if len(keysNeedingTTL) > 0 && !scan.complete {
+			results := processKeysBatchTTL(c, keysNeedingTTL)
+			for i, shouldProcess := range results {
+				if shouldProcess {
+					if processKeyWithTTL(c, keysNeedingTTL[i]) {
+						scan.modified++
+						expired_stats <- 1
+
+						if limit >= 0 && scan.modified >= limit {
+							logger.info.Println("Reached limit of", limit, "modified keys")
+							scan.complete = true
+							break
+						}
+					}
 				}
 			}
 		}
@@ -192,6 +224,151 @@ func main() {
 	(<-done)()
 }
 
+// processKeysBatchTTL processes a batch of keys that need TTL checking using pipelining
+func processKeysBatchTTL(c redis.Conn, keys []string) []bool {
+	results := make([]bool, len(keys))
+
+	if len(keys) == 0 {
+		return results
+	}
+
+	// Always log the keys being processed in verbose mode
+	if verbose {
+		for _, key := range keys {
+			logger.info.Println("Processing key (batch TTL):", key)
+		}
+	}
+
+	// Send all TTL commands in a pipeline
+	for _, key := range keys {
+		c.Send("TTL", key)
+	}
+
+	// Flush and get all results
+	c.Flush()
+
+	for i := range keys {
+		ttl, err := redis.Int(c.Receive())
+		if err != nil {
+			logger.debug.Println("Failed to get TTL for key", keys[i])
+			continue
+		}
+
+		logger.debug.Println("TTL of", ttl, "for key", keys[i])
+
+		// Check if TTL matches criteria
+		if matchTTL(ttl, ttlMin) {
+			results[i] = true
+		} else {
+			logger.debug.Println("TTL", ttl, "doesn't match minimum TTL", ttlMin, "for key", keys[i])
+		}
+	}
+
+	return results
+}
+
+// processKeyNoTTL processes a key without TTL checking (for operations that don't need TTL)
+func processKeyNoTTL(c redis.Conn, key string) (expired bool) {
+	// Always log the key being processed in verbose mode
+	if verbose {
+		logger.info.Println("Processing key (no TTL):", key)
+	}
+
+	// No TTL checking needed, so all keys match
+	if !matchTTL(0, ttlMin) {
+		return false
+	}
+
+	if deleteKeys {
+		if dryRun {
+			return true
+		}
+
+		_, err := c.Do("DEL", key)
+		if err != nil {
+			logger.info.Println("Failed to DELETE key", key, err)
+			return false
+		}
+
+		logger.debug.Println("Deleted key", key)
+		return true
+	}
+
+	if ttlSet > 0 {
+		if dryRun {
+			return true
+		}
+		_, err := c.Do("EXPIRE", key, ttlSet)
+		if err != nil {
+			logger.info.Println("Failed to EXPIRE key", key, err)
+			return false
+		}
+		logger.debug.Println("new TTL of", ttlSet, "for key", key)
+		return true
+	}
+
+	return false
+}
+
+// processKeyWithTTL processes a key that has already had its TTL checked
+func processKeyWithTTL(c redis.Conn, key string) (expired bool) {
+	// Always log the key being processed in verbose mode
+	if verbose {
+		logger.info.Println("Processing key (with TTL):", key)
+	}
+
+	if deleteKeys {
+		if dryRun {
+			return true
+		}
+
+		_, err := c.Do("DEL", key)
+		if err != nil {
+			logger.info.Println("Failed to DELETE key", key, err)
+			return false
+		}
+
+		logger.debug.Println("Deleted key", key)
+		return true
+	}
+
+	if ttlSubtract > 0 {
+		if dryRun {
+			return true
+		}
+		// Note: We need to get TTL again since we only checked it in batch
+		result, err := redis.Int(c.Do("TTL", key))
+		if err != nil {
+			logger.info.Println("Failed to get TTL for key", key, err)
+			return false
+		}
+		newTTL := result - ttlSubtract
+		_, err = c.Do("EXPIRE", key, newTTL)
+		if err != nil {
+			logger.info.Println("Failed to EXPIRE key", key, err)
+			return false
+		}
+		logger.debug.Println("new TTL of", newTTL, "for key", key)
+		return true
+	}
+
+	if ttlSet > 0 {
+		if dryRun {
+			return true
+		}
+		_, err := c.Do("EXPIRE", key, ttlSet)
+		if err != nil {
+			logger.info.Println("Failed to EXPIRE key", key, err)
+			return false
+		}
+		logger.debug.Println("new TTL of", ttlSet, "for key", key)
+		return true
+	}
+
+	return false
+}
+
+// processKey is the original function, kept for backward compatibility
 func processKey(c redis.Conn, key string) (expired bool) {
 	var ttl int
 
