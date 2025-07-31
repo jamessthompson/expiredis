@@ -1,13 +1,13 @@
 package main
 
 import (
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/garyburd/redigo/redis"
+	"github.com/gomodule/redigo/redis"
 	"github.com/namsral/flag"
 )
 
@@ -17,9 +17,10 @@ var (
 	verbose     bool
 	dryRun      bool
 	url         string
+	password    string
 	pattern     string
 	limit       int
-	count       int
+	batchSize   int
 	delay       int64
 	ttlSubtract int
 	ttlSet      int
@@ -38,9 +39,10 @@ func main() {
 	fs.BoolVar(&verbose, "verbose", false, "debug logging")
 	fs.BoolVar(&dryRun, "dry-run", false, "dry run, no destructive commands")
 	fs.StringVar(&url, "url", "redis://", "URI of Redis server (https://www.iana.org/assignments/uri-schemes/prov/redis)")
+	fs.StringVar(&password, "password", "", "Redis password (can also be set via EXPIREDIS_PASSWORD env var)")
 	fs.StringVar(&pattern, "pattern", "*", "Pattern of keys to process")
-	fs.IntVar(&limit, "limit", 100, "Maximum number keys to process")
-	fs.IntVar(&count, "count", 100, "Keys to fetch in each batch")
+	fs.IntVar(&limit, "limit", 100, "Maximum number of keys to modify (delete, set TTL, etc.)")
+	fs.IntVar(&batchSize, "batch-size", 100, "Keys to fetch in each batch")
 	fs.Int64Var(&delay, "delay", 0, "Delay in ms between batches")
 	fs.IntVar(&ttlSet, "set-ttl", 0, "Set TTL in seconds of matched keys")
 	fs.IntVar(&ttlSubtract, "subtract-ttl", 0, "Seconds to subtract from TTL of matched keys")
@@ -51,16 +53,54 @@ func main() {
 	logger.debug = log.New(os.Stderr, "[debug] ", log.LstdFlags)
 	logger.info = log.New(os.Stderr, "[info] ", log.LstdFlags)
 	if !verbose {
-		logger.debug.SetOutput(ioutil.Discard)
+		logger.debug.SetOutput(io.Discard)
 	}
 
-	c, err := redis.DialURL(url)
+	// Validate that at least one operation is specified
+	if !deleteKeys && ttlSubtract == 0 && ttlSet == 0 {
+		logger.info.Fatal("No operation specified. Please use --delete, --set-ttl, or --subtract-ttl")
+	}
+
+	// Output settings in verbose mode (before connection attempt)
+	if verbose {
+		logger.info.Println("=== Configuration Settings ===")
+		logger.info.Printf("Redis URL: %s\n", url)
+		if password != "" {
+			logger.info.Println("Password: [SET]")
+		} else {
+			logger.info.Println("Password: [NOT SET]")
+		}
+		logger.info.Printf("Pattern: %s\n", pattern)
+		logger.info.Printf("Limit: %d (modified keys)\n", limit)
+		logger.info.Printf("Batch Size: %d\n", batchSize)
+		logger.info.Printf("Delay: %dms\n", delay)
+		logger.info.Printf("TTL Min: %d\n", ttlMin)
+		logger.info.Printf("TTL Set: %d\n", ttlSet)
+		logger.info.Printf("TTL Subtract: %d\n", ttlSubtract)
+		logger.info.Printf("Delete Keys: %t\n", deleteKeys)
+		logger.info.Printf("Dry Run: %t\n", dryRun)
+		logger.info.Printf("Verbose: %t\n", verbose)
+		logger.info.Println("==============================")
+	}
+
+	var c redis.Conn
+	var err error
+
+	if password != "" {
+		// Use password authentication
+		c, err = redis.DialURL(url, redis.DialPassword(password))
+	} else {
+		// Use URL-based connection (password can be in URL)
+		c, err = redis.DialURL(url)
+	}
+
 	if err != nil {
 		logger.info.Fatal("Failed to connect to redis: ", err)
 	}
 	defer c.Close()
 
 	logger.info.Println("Connected to redis server at", url)
+
 	if dryRun {
 		logger.info.Println("Dry-run mode: destructive commands skipped")
 	}
@@ -74,14 +114,22 @@ func main() {
 	var scan struct {
 		cursor   int
 		batch    []string
-		total    int
+		scanned  int
+		modified int
 		complete bool
 	}
+
 	scan.cursor = 0
-	scan.total = 0
+	scan.scanned = 0
+	scan.modified = 0
+	scan.complete = false
 
 	for {
-		result, err := redis.Values(c.Do("SCAN", scan.cursor, "MATCH", pattern, "COUNT", count))
+		if verbose {
+			logger.info.Printf("Scanning with cursor %d, pattern '%s', batch-size %d\n", scan.cursor, pattern, batchSize)
+		}
+
+		result, err := redis.Values(c.Do("SCAN", scan.cursor, "MATCH", pattern, "COUNT", batchSize))
 		if err != nil {
 			logger.info.Println("Failed to execute SCAN:", err)
 			time.Sleep(time.Second)
@@ -95,24 +143,42 @@ func main() {
 			continue
 		}
 
-		for _, key := range scan.batch {
-			scan.total++
+		if verbose {
+			logger.info.Printf("Found %d keys in this batch\n", len(scan.batch))
+		}
 
-			if limit >= 0 && scan.total >= limit {
-				logger.info.Println("Reached limit of", limit, "keys")
-				scan.complete = true
-				break
-			}
+		for _, key := range scan.batch {
+			scan.scanned++
 
 			if processKey(c, key) {
+				scan.modified++
 				expired_stats <- 1
+
+				logger.info.Printf("Modified %d keys so far. Limit is %d\n", scan.modified, limit)
+				if limit >= 0 && scan.modified >= limit {
+					logger.info.Println("Reached limit of", limit, "modified keys")
+					scan.complete = true
+					break
+				}
 			}
 		}
 
+		// Break immediately if we've reached the limit
+		if scan.complete {
+			if verbose {
+				logger.info.Printf("Breaking main loop: limit reached, complete=%t\n", scan.complete)
+			}
+			break
+		}
+
+		// Only send stats if we haven't reached the limit
 		scan_stats <- 1
 		keys_stats <- len(scan.batch)
 
-		if scan.cursor == 0 || scan.complete {
+		if scan.cursor == 0 {
+			if verbose {
+				logger.info.Printf("Breaking main loop: scan complete, cursor=%d\n", scan.cursor)
+			}
 			break
 		}
 		logger.debug.Println("Next cursor is", scan.cursor)
@@ -128,6 +194,11 @@ func main() {
 
 func processKey(c redis.Conn, key string) (expired bool) {
 	var ttl int
+
+	// Always log the key being processed in verbose mode
+	if verbose {
+		logger.info.Println("Processing key:", key)
+	}
 
 	// Only fetch TTL if we need it for minimum threshold or subtracting
 	if ttlMin != 0 || ttlSubtract != 0 {
@@ -215,8 +286,13 @@ func stats(done chan func(), scans chan int, keys chan int, expired chan int) {
 	expired_count := 0
 
 	printStats := func() {
-		logger.info.Printf("Stats: scans=%d keys=%d expires=%d\n",
-			scan_count, keys_count, expired_count)
+		if dryRun {
+			logger.info.Printf("Stats: scans=%d keys_scanned=%d keys_would_be_modified=%d (DRY RUN)\n",
+				scan_count, keys_count, expired_count)
+		} else {
+			logger.info.Printf("Stats: scans=%d keys_scanned=%d keys_modified=%d\n",
+				scan_count, keys_count, expired_count)
+		}
 	}
 
 	for {
@@ -234,7 +310,7 @@ func stats(done chan func(), scans chan int, keys chan int, expired chan int) {
 			printStats()
 
 		case done <- printStats:
-			break
+			return // Exit the goroutine after sending the final stats
 		}
 	}
 }
