@@ -12,6 +12,7 @@ Usage of ./expiredis:
   --password="": Redis password (can also be set via EXPIREDIS_PASSWORD env var)
   --pattern="*": Pattern of keys to process
   --set-ttl=0: Set TTL in seconds of matched keys
+  --skip-tls-verify=false: Skip TLS certificate validation (use with caution)
   --subtract-ttl=0: Seconds to subtract from TTL of matched keys
   --ttl-min=0: Minimum TTL for a key to be processed. Use -1 to match no TTL.
   --url="redis://": URI of Redis server (https://www.iana.org/assignments/uri-schemes/prov/redis)
@@ -64,6 +65,21 @@ EXPIREDIS_PASSWORD="mysecret" ./expiredis --url "redis://localhost:6379"
 ./expiredis --url "redis://:mysecret@localhost:6379"
 ```
 
+### Use TLS with Redis
+
+```bash
+# Connect to Redis with TLS (rediss://)
+./expiredis --url "rediss://localhost:6380"
+
+# Connect to Redis with TLS and skip certificate validation (for self-signed certs)
+./expiredis --url "rediss://localhost:6380" --skip-tls-verify
+
+# Connect to Redis with TLS, password, and skip certificate validation
+./expiredis --url "rediss://localhost:6380" --password "mysecret" --skip-tls-verify
+```
+
+**Security Note:** The `--skip-tls-verify` flag disables certificate validation, which makes the connection vulnerable to man-in-the-middle attacks. Only use this flag in development environments or when connecting to trusted Redis instances with self-signed certificates.
+
 ### Dry run mode (preview changes without making them)
 
 ```bash
@@ -78,6 +94,7 @@ All flags can also be set via environment variables with the `EXPIREDIS_` prefix
 export EXPIREDIS_PASSWORD="mysecret"
 export EXPIREDIS_PATTERN="user:*"
 export EXPIREDIS_DRY_RUN="true"
+export EXPIREDIS_SKIP_TLS_VERIFY="true"
 ./expiredis
 ```
 
