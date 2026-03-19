@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"io"
 	"log"
 	"os"
@@ -26,6 +27,7 @@ var (
 	ttlSet      int
 	deleteKeys  bool
 	ttlMin      int
+	skipTLSVerify bool
 	logger      struct {
 		debug *log.Logger
 		info  *log.Logger
@@ -48,6 +50,7 @@ func main() {
 	fs.IntVar(&ttlSubtract, "subtract-ttl", 0, "Seconds to subtract from TTL of matched keys")
 	fs.BoolVar(&deleteKeys, "delete", false, "Delete matched keys")
 	fs.IntVar(&ttlMin, "ttl-min", 0, "Minimum TTL for a key to be processed. Use -1 to match no TTL.")
+	fs.BoolVar(&skipTLSVerify, "skip-tls-verify", false, "Skip TLS certificate validation (use with caution)")
 	fs.Parse(os.Args[1:])
 
 	logger.debug = log.New(os.Stderr, "[debug] ", log.LstdFlags)
@@ -78,6 +81,7 @@ func main() {
 		logger.info.Printf("TTL Set: %d\n", ttlSet)
 		logger.info.Printf("TTL Subtract: %d\n", ttlSubtract)
 		logger.info.Printf("Delete Keys: %t\n", deleteKeys)
+		logger.info.Printf("Skip TLS Verify: %t\n", skipTLSVerify)
 		logger.info.Printf("Dry Run: %t\n", dryRun)
 		logger.info.Printf("Verbose: %t\n", verbose)
 		logger.info.Println("==============================")
@@ -86,11 +90,25 @@ func main() {
 	var c redis.Conn
 	var err error
 
+	// Prepare dial options
+	var dialOptions []redis.DialOption
+
+	// Add password if provided
 	if password != "" {
-		// Use password authentication
-		c, err = redis.DialURL(url, redis.DialPassword(password))
+		dialOptions = append(dialOptions, redis.DialPassword(password))
+	}
+
+	// Add TLS configuration if skip verification is enabled
+	if skipTLSVerify {
+		dialOptions = append(dialOptions, redis.DialTLSConfig(&tls.Config{
+			InsecureSkipVerify: true,
+		}))
+	}
+
+	// Connect with options
+	if len(dialOptions) > 0 {
+		c, err = redis.DialURL(url, dialOptions...)
 	} else {
-		// Use URL-based connection (password can be in URL)
 		c, err = redis.DialURL(url)
 	}
 
@@ -179,19 +197,17 @@ func main() {
 		// Process keys that need TTL checking in batches
 		if len(keysNeedingTTL) > 0 && !scan.complete {
 			results := processKeysBatchTTL(c, keysNeedingTTL)
-			for i, shouldProcess := range results {
-				if shouldProcess {
-					if processKeyWithTTL(c, keysNeedingTTL[i]) {
-						scan.modified++
-						expired_stats <- 1
+			modifiedCount := processKeysBatchOperations(c, keysNeedingTTL, results)
+			scan.modified += modifiedCount
 
-						if limit >= 0 && scan.modified >= limit {
-							logger.info.Println("Reached limit of", limit, "modified keys")
-							scan.complete = true
-							break
-						}
-					}
-				}
+			// Send stats for all modified keys
+			for i := 0; i < modifiedCount; i++ {
+				expired_stats <- 1
+			}
+
+			if limit >= 0 && scan.modified >= limit {
+				logger.info.Println("Reached limit of", limit, "modified keys")
+				scan.complete = true
 			}
 		}
 
@@ -265,6 +281,112 @@ func processKeysBatchTTL(c redis.Conn, keys []string) []bool {
 	}
 
 	return results
+}
+
+// processKeysBatchOperations processes operations (DEL, EXPIRE, TTL subtract) in batches using pipelining
+func processKeysBatchOperations(c redis.Conn, keys []string, shouldProcess []bool) int {
+	modifiedCount := 0
+
+	if len(keys) == 0 {
+		return modifiedCount
+	}
+
+	// Collect keys that should be processed
+	var keysToProcess []string
+	for i, should := range shouldProcess {
+		if should {
+			keysToProcess = append(keysToProcess, keys[i])
+		}
+	}
+
+	if len(keysToProcess) == 0 {
+		return modifiedCount
+	}
+
+			// Always log the keys being processed in verbose mode
+		if verbose {
+			for _, key := range keysToProcess {
+				logger.info.Println("Processing operation (batch):", key)
+			}
+		}
+
+	if deleteKeys {
+		if dryRun {
+			modifiedCount = len(keysToProcess)
+			if verbose {
+				logger.info.Printf("Would delete %d keys (dry run)\n", modifiedCount)
+			}
+			return modifiedCount
+		}
+
+		// Pipeline DELETE operations
+		for _, key := range keysToProcess {
+			c.Send("DEL", key)
+		}
+		c.Flush()
+
+		for i := range keysToProcess {
+			_, err := c.Receive()
+			if err != nil {
+				logger.debug.Println("Failed to DELETE key", keysToProcess[i])
+				continue
+			}
+			modifiedCount++
+			logger.debug.Println("Deleted key", keysToProcess[i])
+		}
+	} else if ttlSubtract > 0 {
+		if dryRun {
+			modifiedCount = len(keysToProcess)
+			if verbose {
+				logger.info.Printf("Would subtract TTL from %d keys (dry run)\n", modifiedCount)
+			}
+			return modifiedCount
+		}
+
+		// For TTL subtract, we need to get current TTL first, then set new TTL
+		// This requires individual processing since we need the current TTL
+		for _, key := range keysToProcess {
+			result, err := redis.Int(c.Do("TTL", key))
+			if err != nil {
+				logger.debug.Println("Failed to get TTL for key", key)
+				continue
+			}
+			newTTL := result - ttlSubtract
+			_, err = c.Do("EXPIRE", key, newTTL)
+			if err != nil {
+				logger.debug.Println("Failed to set TTL for key", key)
+				continue
+			}
+			modifiedCount++
+			logger.debug.Println("new TTL of", newTTL, "for key", key)
+		}
+	} else if ttlSet > 0 {
+		if dryRun {
+			modifiedCount = len(keysToProcess)
+			if verbose {
+				logger.info.Printf("Would set TTL for %d keys (dry run)\n", modifiedCount)
+			}
+			return modifiedCount
+		}
+
+		// Pipeline EXPIRE operations
+		for _, key := range keysToProcess {
+			c.Send("EXPIRE", key, ttlSet)
+		}
+		c.Flush()
+
+		for i := range keysToProcess {
+			_, err := c.Receive()
+			if err != nil {
+				logger.debug.Println("Failed to set TTL for key", keysToProcess[i])
+				continue
+			}
+			modifiedCount++
+			logger.debug.Println("new TTL of", ttlSet, "for key", keysToProcess[i])
+		}
+	}
+
+	return modifiedCount
 }
 
 // processKeyNoTTL processes a key without TTL checking (for operations that don't need TTL)
